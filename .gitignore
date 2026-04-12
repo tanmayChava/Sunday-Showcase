@@ -1,0 +1,51 @@
+# ── Dependencies ───────────────────────────────────────────
+node_modules/
+
+# ── Environment Variables — NEVER commit these ──────────────
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.env
+
+# ── Logs — can contain user messages / API responses ────────
+*.log
+logs/
+npm-debug.log*
+
+# ── Build output ────────────────────────────────────────────
+dist/
+.next/
+
+# ── Database files ──────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── IDE ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Local-only configs ──────────────────────────────────────
+ecosystem.config.cjs
+mcp.json
+
+# ── Any secrets / credential files ──────────────────────────
+secrets.json
+credentials.json
+service-account.json
+*private*.json
+*secret*.json
+
+# ── Session data ────────────────────────────────────────────
+*.session
+sessions/
+
+# ── Mission Control (local dashboard — not for sharing) ─────
+mission-control/
+mission-control-react/
