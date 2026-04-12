@@ -131,26 +131,7 @@ Create a `.env` file in the project root:
 
 ```env
 # Required
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-GEMINI_API_KEYS=key1,key2,key3
-ALLOWED_USER_IDS=123456789,987654321
 
-# Optional — Gemini model (default: gemini-2.5-flash)
-GEMINI_MODEL=gemini-2.5-flash
-
-# Optional — Persistent memory
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
-
-# Optional — Web search
-TAVILY_API_KEY=your_tavily_key
-
-# Optional — LLM fallback
-OPENROUTER_API_KEY=your_openrouter_key
-OPENROUTER_MODEL=mistralai/mistral-small-3.1-24b-instruct:free
-
-# Optional — Proactive heartbeat
-HEARTBEAT_CHAT_ID=your_telegram_chat_id
 ```
 
 ### 4. Run
