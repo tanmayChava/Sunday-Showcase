@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+*.db
+*.sqlite
+*.log
+.git/
+.gitignore
+.vscode/
+.idea/
+mission-control/
+supabase/
+Thumbs.db
+.DS_Store

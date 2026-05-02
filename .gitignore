@@ -1,7 +1,7 @@
-# ── Dependencies ───────────────────────────────────────────
+# Dependencies
 node_modules/
 
-# ── Environment Variables — NEVER commit these ──────────────
+# Environment variables — NEVER commit these
 .env
 .env.local
 .env.*.local
@@ -9,43 +9,43 @@ node_modules/
 .env.development
 *.env
 
-# ── Logs — can contain user messages / API responses ────────
-*.log
-logs/
-npm-debug.log*
-
-# ── Build output ────────────────────────────────────────────
-dist/
-.next/
-
-# ── Database files ──────────────────────────────────────────
+# Database files
 *.db
 *.sqlite
 *.sqlite3
 
-# ── IDE ─────────────────────────────────────────────────────
+# IDE
 .vscode/
 .idea/
 
-# ── OS ──────────────────────────────────────────────────────
+# OS files
 .DS_Store
 Thumbs.db
 
-# ── Local-only configs ──────────────────────────────────────
-ecosystem.config.cjs
-mcp.json
+# Logs — can contain user messages, tool outputs, API responses
+*.log
+logs/
+npm-debug.log*
 
-# ── Any secrets / credential files ──────────────────────────
+# Build output
+dist/
+.next/
+
+# Mission Control (local only — contains hardcoded Supabase credentials)
+mission-control/
+mission-control-react/
+
+# Any secrets/credential files
 secrets.json
 credentials.json
 service-account.json
 *private*.json
 *secret*.json
 
-# ── Session data ────────────────────────────────────────────
+# Session data and runtime files
 *.session
 sessions/
 
-# ── Mission Control (local dashboard — not for sharing) ─────
-mission-control/
-mission-control-react/
+# Local-only configs (PM2, MCP) — not needed on Railway
+ecosystem.config.cjs
+mcp.json

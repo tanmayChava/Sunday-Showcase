@@ -12,6 +12,7 @@ RUN npm ci
 COPY src/ ./src/
 COPY tsconfig.json ./
 COPY soul.md ./
+COPY mcp.json ./
 COPY skills/ ./skills/
 # Create logs directory
 RUN mkdir -p logs
