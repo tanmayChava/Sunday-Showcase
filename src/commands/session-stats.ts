@@ -258,39 +258,6 @@ export function recordTokenUsage(
         ` total=${totalTokens} cost=$${costUsd.toFixed(6)} latency=${latencyMs}ms`,
     );
 
-    // Persist to Supabase for Mission Control dashboard (fire-and-forget)
-    persistUsageLog(chatId, record).catch((err) =>
-        console.warn("[Usage] Failed to persist usage log:", err),
-    );
-}
-
-/**
- * Write a usage record to Supabase so Mission Control can display real cost data.
- * This is fire-and-forget — never blocks the agent response.
- */
-async function persistUsageLog(chatId: string, record: CallRecord): Promise<void> {
-    // Dynamic import to avoid circular dependencies at module load time
-    const { getSupabase } = await import("../lib/supabase.js");
-    const sb = getSupabase();
-    if (!sb) return;
-
-    const { error } = await sb.from("usage_logs").insert({
-        chat_id: chatId,
-        model: record.model,
-        prompt_tokens: record.promptTokens,
-        completion_tokens: record.completionTokens,
-        total_tokens: record.totalTokens,
-        estimated_cost_usd: record.estimatedCostUsd,
-        latency_ms: record.latencyMs,
-        created_at: record.timestamp,
-    });
-
-    if (error) {
-        // Table might not exist yet — that's fine, just log once
-        if (!error.message?.includes("usage_logs")) {
-            console.warn("[Usage] Supabase insert error:", error.message);
-        }
-    }
 }
 
 /**

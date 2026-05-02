@@ -14,75 +14,16 @@ import { handleSlashCommand, getEffectiveModel } from "./commands/slash-commands
 import { getProviderName } from "./lib/router.js";
 import { startWebhookServer, stopWebhookServer } from "./channels/webhook.js";
 import { restoreReminders } from "./tools/set_reminder.js";
+import { runDeprecationSweep } from "./skills/feedback.js";
+import { getEmbeddingProvider, getEmbeddingDimensions } from "./lib/embeddings.js";
+import { prettifyModelName } from "./lib/model-names.js";
 
 console.log("============== SUNDAY — Superior Universal Neural Digital Assistant Yield ==============");
 console.log("Initializing secure local environment...");
 console.log(`Allowed Users: ${Array.from(ENV.ALLOWED_USER_IDS).join(", ")}`);
 
-// ─── Friendly Model Name Map ──────────────────────────────────────
+// ─── Startup ─────────────────────────────────────────────────────
 
-const FRIENDLY_NAMES: Record<string, string> = {
-  // Gemini
-  "gemini-3-flash-preview": "Gemini 3 Flash",
-  "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
-  "gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash Lite",
-  "gemini-2.5-pro": "Gemini 2.5 Pro",
-  "gemini-2.5-flash": "Gemini 2.5 Flash",
-  "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite",
-  "gemini-2.0-flash": "Gemini 2.0 Flash",
-  "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite",
-  "gemini-1.5-pro": "Gemini 1.5 Pro",
-  "gemini-1.5-flash": "Gemini 1.5 Flash",
-  "gemini-1.5-flash-8b": "Gemini 1.5 Flash 8B",
-  // Claude
-  "anthropic/claude-3.7-sonnet": "Claude 3.7 Sonnet",
-  "anthropic/claude-3.7-opus": "Claude 3.7 Opus",
-  "anthropic/claude-3.5-haiku": "Claude 3.5 Haiku",
-  "anthropic/claude-3.5-sonnet": "Claude 3.5 Sonnet",
-  // GPT
-  "openai/gpt-4o": "GPT-4o",
-  "openai/gpt-4o-mini": "GPT-4o Mini",
-  "openai/gpt-5.4": "GPT-5",
-  "openai/gpt-5.4-mini": "GPT-5 Mini",
-  "openai/o3": "o3",
-  "openai/o4-mini": "o4 Mini",
-  // Llama
-  "meta-llama/llama-4-maverick:free": "Llama 4 Maverick (free)",
-  "meta-llama/llama-4-scout:free": "Llama 4 Scout (free)",
-  "meta-llama/llama-4-maverick": "Llama 4 Maverick",
-  // DeepSeek
-  "deepseek/deepseek-chat-v3-0324:free": "DeepSeek V3 (free)",
-  "deepseek/deepseek-r1-0528:free": "DeepSeek R1 (free)",
-  "deepseek/deepseek-r1-zero:free": "DeepSeek R1 Zero (free)",
-  // Qwen
-  "qwen/qwen3-235b-a22b:free": "Qwen 3 235B (free)",
-  "qwen/qwen3-coder-480b-a35b:free": "Qwen 3 Coder (free)",
-  // Mistral
-  "mistralai/mistral-small-3.1-24b-instruct:free": "Mistral Small 3.1 (free)",
-  "mistralai/mistral-7b-instruct:free": "Mistral 7B (free)",
-  "mistralai/mistral-large": "Mistral Large",
-  // Other
-  "microsoft/phi-4-reasoning-plus:free": "Phi-4 Reasoning+ (free)",
-  "nvidia/nemotron-3-super:free": "Nemotron 3 Super (free)",
-};
-
-/**
- * Convert a raw model ID into a human-friendly display name.
- * Falls back to a cleaned-up version of the raw ID if not in the map.
- */
-function prettifyModelName(model: string): string {
-  // Check exact match first
-  if (FRIENDLY_NAMES[model]) return FRIENDLY_NAMES[model];
-
-  // Fallback: strip provider prefix and clean up
-  const name = model.includes("/") ? model.split("/").pop()! : model;
-  return name
-    .replace(/:free$/, " (free)")
-    .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
-// Initialize memory system before starting the bot
 async function start() {
   // Check Supabase connection
   const supabaseOk = await isSupabaseReady();
@@ -93,6 +34,9 @@ async function start() {
     await initConfigSync();
     // Initialize skills system with Supabase hot-reload
     await initSkillsSystem("skills");
+
+    // Run deprecation sweep on startup (4.6 — disables zero-use old skills)
+    runDeprecationSweep();
   } else {
     console.warn(
       "[Memory] Supabase unavailable — running without persistent memory.",
@@ -171,6 +115,9 @@ async function start() {
       );
     }
   }
+
+  // Log embedding provider info (4.5)
+  console.log(`[Embeddings] Provider: ${getEmbeddingProvider()} · Dimensions: ${getEmbeddingDimensions()}`);
 
   // Restore pending reminders from Supabase (must happen after channel init)
   await restoreReminders();

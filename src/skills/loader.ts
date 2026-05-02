@@ -269,15 +269,34 @@ export function getActiveSkills(): Skill[] {
 
 // ─── Prompt Builder ──────────────────────────────────────────────
 
-function rebuildPromptCache(): void {
-  const active = getActiveSkills();
+/**
+ * Maximum skills injected into the system prompt per request.
+ * All skills remain available in the store — only the injected count is capped.
+ * Supabase-sourced skills (operator-configured) take priority over local files.
+ */
+const MAX_ACTIVE_SKILLS = 5;
 
-  if (active.length === 0) {
+function rebuildPromptCache(): void {
+  const allActive = getActiveSkills();
+
+  if (allActive.length === 0) {
     cachedPrompt = "";
     return;
   }
 
+  // Prioritise Supabase skills (operator-configured) over local file skills,
+  // then cap to MAX_ACTIVE_SKILLS to keep context lean.
+  const supabaseFirst = [
+    ...allActive.filter((s) => s.source === "supabase"),
+    ...allActive.filter((s) => s.source === "local"),
+  ];
+  const active = supabaseFirst.slice(0, MAX_ACTIVE_SKILLS);
+  const capped = allActive.length > MAX_ACTIVE_SKILLS;
+
   const parts = ["## Active Skills"];
+  if (capped) {
+    parts.push(`_Showing ${active.length} of ${allActive.length} available skills._`);
+  }
 
   for (const skill of active) {
     parts.push(`### ${skill.name}`);
@@ -289,7 +308,7 @@ function rebuildPromptCache(): void {
 
   cachedPrompt = parts.join("\n\n");
   console.log(
-    `[Skills] Prompt rebuilt — ${active.length} active skill(s).`,
+    `[Skills] Prompt rebuilt — ${active.length}/${allActive.length} skill(s) active (cap: ${MAX_ACTIVE_SKILLS}).`,
   );
 }
 
@@ -325,11 +344,17 @@ export function buildSkillsPrompt(skills?: Skill[]): string {
  * @param localDir  Path to the local skills directory (e.g. `resolve(cwd, 'skills')`)
  */
 export async function initSkillsSystem(localDir: string): Promise<void> {
-  // 1. Load local skills as baseline
+  // 1. Load hand-crafted skills from the main dir
   const locals = loadSkills(localDir);
-  localSkills = new Map(locals.map((s) => [s.slug, s]));
 
-  // 2. Try loading from Supabase
+  // 2. Also load auto-generated skills from skills/auto/
+  const autoDir = resolve(localDir, "auto");
+  const autoLocals = loadSkills(autoDir);
+  const allLocals = [...locals, ...autoLocals];
+
+  localSkills = new Map(allLocals.map((s) => [s.slug, s]));
+
+  // 3. Try loading from Supabase
   const ready = await isSupabaseReady();
   if (ready) {
     await loadSupabaseSkills();

@@ -27,6 +27,7 @@ import {
 import type { SubAgentProfile } from "../agent/profiles.js";
 import { ENV } from "../config.js";
 import { getEffectiveModel } from "../commands/slash-commands.js";
+import { triggerSkillExtraction } from "../skills/auto-generator.js";
 
 // ─── Tool Definition ─────────────────────────────────────────────
 
@@ -114,7 +115,7 @@ export async function executeDelegate(
         // Dynamic import to break circular dependency (loop → delegate → loop)
         const { runSubAgentLoop } = await import("../agent/sub-loop.js");
 
-        const result = await runSubAgentLoop({
+        const { response: result, iterationsUsed } = await runSubAgentLoop({
             message: subAgentMessage,
             chatId,
             profile,
@@ -122,7 +123,18 @@ export async function executeDelegate(
         });
 
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`[Delegate] ${profile.icon} ${profile.label} completed in ${elapsed}s`);
+        const elapsedNum = parseFloat(elapsed);
+        console.log(`[Delegate] ${profile.icon} ${profile.label} completed in ${elapsed}s (${iterationsUsed} iteration(s))`);
+
+        // Trigger background skill extraction with REAL iteration count (HIGH-02 fix)
+        triggerSkillExtraction({
+            agentName: profile.name,
+            agentLabel: profile.label,
+            taskDescription: task,
+            result,
+            iterationsUsed, // real count from sub-loop, not a timing estimate
+            elapsedSeconds: elapsedNum,
+        });
 
         // Format the result with metadata
         return formatSubAgentResult(profile, result, elapsed);

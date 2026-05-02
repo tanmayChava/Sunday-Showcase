@@ -16,20 +16,18 @@
  *   - Automatic fallback: Gemini → OpenRouter on failure
  *
  * Tool Registry:
- *   Built-in tools are registered centrally in tools/registry.ts.
- *   MCP tools are merged dynamically on each iteration.
- *   An optional `allowedToolNames` filter restricts which tools
- *   are visible/executable (used by sub-agents).
+ *   Built-in tools are registered centrally via initBuiltinTools() in
+ *   tools/registry.ts. MCP tools are merged dynamically on each iteration.
+ *   An optional `allowedToolNames` filter restricts which tools are
+ *   visible/executable (used by sub-agents).
  */
 
-import { readFileSync } from "fs";
+import { readFileSync, statSync } from "fs";
 import { resolve } from "path";
-
 
 // Provider-agnostic types + router
 import type {
   LLMMessage,
-  LLMToolCall,
   LLMToolResult,
   LLMToolSchema,
   LLMResponse,
@@ -37,50 +35,16 @@ import type {
 import { routedChat, getProviderName } from "../lib/router.js";
 import { geminiToolsToSchemas } from "../lib/tool-bridge.js";
 
-
 import { ENV } from "../config.js";
 import { getRuntimeConfig } from "../lib/config-sync.js";
 
 // Centralized tool registry
 import {
-  registerTool,
+  initBuiltinTools,
   getFilteredToolEntries,
   getToolDefinitions,
   getToolExecutor,
 } from "../tools/registry.js";
-
-// Built-in tool definitions + executors
-import {
-  getCurrentTimeDefinition,
-  executeGetCurrentTime,
-} from "../tools/get_current_time.js";
-import {
-  rememberFactDefinition,
-  executeRememberFact,
-} from "../tools/remember_fact.js";
-import {
-  webSearchDefinition,
-  executeWebSearch,
-  webResearchDefinition,
-  executeWebResearch,
-} from "../tools/web_search.js";
-import { readUrlDefinition, executeReadUrl } from "../tools/read_url.js";
-import {
-  setReminderDefinition,
-  executeSetReminder,
-} from "../tools/set_reminder.js";
-import {
-  browsePageDefinition,
-  executeBrowsePage,
-} from "../tools/browse_page.js";
-import {
-  delegateDefinition,
-  executeDelegate,
-} from "../tools/delegate.js";
-import {
-  apifyJobSearchDefinition,
-  executeApifyJobSearch,
-} from "../tools/apify_job_search.js";
 
 // Memory tiers
 import { buildCoreMemoryPrompt, getCoreMemory } from "../memory/core.js";
@@ -89,6 +53,10 @@ import {
   buildSemanticPrompt,
   triggerFactExtraction,
 } from "../memory/semantic.js";
+import {
+  buildUserProfilePrompt,
+  triggerUserProfileUpdate,
+} from "../memory/user-profile.js";
 
 // Skills system
 import { buildSkillsPrompt } from "../skills/loader.js";
@@ -103,86 +71,62 @@ import { recordTokenUsage } from "../commands/session-stats.js";
 import { getEffectiveModel } from "../commands/slash-commands.js";
 
 const MAX_ITERATIONS = 5;
-const MAX_LOOP_TIMEOUT_MS = 120_000; // 120 seconds hard wall-clock limit
+const MAX_LOOP_TIMEOUT_MS = 300_000; // 300 seconds (5 min) — job searches can take 2–5 min across platforms
 
 // ─── Soul (loaded once at startup) ───────────────────────────────
+//
+// IMP-06: soul.md is loaded from the filesystem with no prior validation.
+// A corrupted, oversized, or adversarially crafted file would silently
+// poison the system prompt for EVERY LLM call. Guards added:
+//   1. Max file size of 64 KB — anything larger is almost certainly wrong.
+//   2. NUL-byte rejection — NUL bytes break context parsing and may indicate
+//      binary corruption or an injection attempt.
+//   3. Minimum content check — an empty file would wipe the agent's identity.
+
+const SOUL_MAX_BYTES = 64 * 1024; // 64 KB
 
 let soulPrompt = "";
 try {
-  soulPrompt = readFileSync(resolve(process.cwd(), "soul.md"), "utf-8");
-  console.log("[Soul] Loaded personality from soul.md");
-} catch {
-  console.warn("[Soul] soul.md not found — using default personality.");
+  const soulPath = resolve(process.cwd(), "soul.md");
+  const stat = statSync(soulPath);
+
+  if (stat.size > SOUL_MAX_BYTES) {
+    throw new Error(
+      `soul.md is oversized (${stat.size} bytes, max ${SOUL_MAX_BYTES}). ` +
+      "Refusing to load — truncated system prompts cause undefined behaviour.",
+    );
+  }
+
+  const raw = readFileSync(soulPath, "utf-8");
+
+  if (raw.includes("\x00")) {
+    throw new Error(
+      "soul.md contains NUL bytes — possible file corruption or injection attempt. Refusing to load.",
+    );
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed.length < 20) {
+    throw new Error(
+      `soul.md appears empty or too short (${trimmed.length} chars). ` +
+      "Refusing to use it as a system prompt.",
+    );
+  }
+
+  soulPrompt = trimmed;
+  console.log(`[Soul] Loaded personality from soul.md (${stat.size} bytes).`);
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.warn(`[Soul] soul.md not loaded — ${msg}`);
+  console.warn("[Soul] Falling back to built-in default personality.");
   soulPrompt = "You are SUNDAY (Superior Universal Neural Digital Assistant Yield), a sharp personal AI agent.";
 }
 
 // ─── Register Built-in Tools ─────────────────────────────────────
-
-registerTool({
-  name: "get_current_time",
-  definition: getCurrentTimeDefinition,
-  executor: async () => executeGetCurrentTime(),
-});
-registerTool({
-  name: "remember_fact",
-  definition: rememberFactDefinition,
-  executor: async (args) =>
-    executeRememberFact(args as { key: string; value: string }),
-});
-registerTool({
-  name: "web_search",
-  definition: webSearchDefinition,
-  executor: async (args) => executeWebSearch((args as { query: string }).query),
-});
-registerTool({
-  name: "web_research",
-  definition: webResearchDefinition,
-  executor: async (args) =>
-    executeWebResearch((args as { query: string }).query),
-});
-registerTool({
-  name: "read_url",
-  definition: readUrlDefinition,
-  executor: async (args) => executeReadUrl((args as { url: string }).url),
-});
-registerTool({
-  name: "set_reminder",
-  definition: setReminderDefinition,
-  executor: async (args, chatId) =>
-    executeSetReminder(args as { message: string; minutes: number }, chatId),
-});
-registerTool({
-  name: "browse_page",
-  definition: browsePageDefinition,
-  executor: async (args) =>
-    executeBrowsePage(
-      args as { url: string; wait_for?: string; extract_selector?: string },
-    ),
-});
-registerTool({
-  name: "delegate",
-  definition: delegateDefinition,
-  executor: async (args, chatId) =>
-    executeDelegate(
-      args as { agent: string; task: string; context?: string },
-      chatId,
-    ),
-});
-registerTool({
-  name: "apify_job_search",
-  definition: apifyJobSearchDefinition,
-  executor: async (args) =>
-    executeApifyJobSearch(
-      args as {
-        role: string;
-        location?: string;
-        platform?: string;
-        date_posted?: string;
-        max_results?: number;
-        experience_level?: string;
-      },
-    ),
-});
+// Tools are now registered via initBuiltinTools() in tools/registry.ts.
+// This call is the only coupling point — loop.ts no longer imports or
+// registers individual tool modules directly.
+await initBuiltinTools();
 
 // Tool usage rules (appended after soul + skills)
 const toolRules =
@@ -262,6 +206,12 @@ async function buildSystemInstruction(
     parts.push(coreMemory);
   }
 
+  // 5b. User Profile (always active, injected after core memory)
+  const userProfileBlock = buildUserProfilePrompt();
+  if (userProfileBlock) {
+    parts.push(userProfileBlock);
+  }
+
   // 6. Tier 2 Rolling Summary
   const rollingSummary = getCoreMemory(`rolling_summary_${chatId}`);
   if (rollingSummary) {
@@ -315,7 +265,7 @@ async function executeTool(
   return `Error: Unknown tool "${name}"`;
 }
 
-// ─── Agent Loop ──────────────────────────────────────────────────
+// ─── Tool Schema Builder ─────────────────────────────────────────
 
 /**
  * Get available tool schemas + permitted names, respecting allow/deny lists.
@@ -378,11 +328,137 @@ function getAvailableTools(
     permittedNames.delete("delegate");
   }
 
-  return {
-    schemas: allSchemas,
-    permittedNames,
-  };
+  return { schemas: allSchemas, permittedNames };
 }
+
+// ─── Shared Inner Loop Core ──────────────────────────────────────
+
+/**
+ * The shared agentic iteration engine used by both text and vision entry points.
+ *
+ * Accepts a pre-built messages array (the first user message may or may not
+ * include inline images) and runs the tool-call → LLM → tool-result cycle
+ * until a final text response is produced or the iteration limit is reached.
+ *
+ * @param chatId           Chat ID for memory scoping and token tracking
+ * @param userMessage      The raw user text (used for background triggers)
+ * @param systemInstruction Full assembled system prompt
+ * @param initialMessages  Pre-built LLMMessage[] including the first user turn
+ * @param availableTools   Schemas + permitted names from getAvailableTools()
+ * @param iterLimit        Max iterations before giving up
+ * @param logPrefix        Log tag — "[Agent]" or "[Agent/Vision]"
+ */
+async function runLoop(
+  chatId: string,
+  userMessage: string,
+  systemInstruction: string,
+  initialMessages: LLMMessage[],
+  availableTools: { schemas: LLMToolSchema[]; permittedNames: Set<string> },
+  iterLimit: number,
+  logPrefix: string,
+): Promise<string> {
+  const messages: LLMMessage[] = [...initialMessages];
+  const { schemas, permittedNames } = availableTools;
+  let iterationCount = 0;
+
+  while (iterationCount < iterLimit) {
+    iterationCount++;
+
+    const activeModel = getEffectiveModel(chatId);
+    const provider = getProviderName(activeModel);
+    console.log(
+      `${logPrefix} Iteration ${iterationCount}/${iterLimit} — ${activeModel} (${provider})`,
+    );
+
+    // Ask LLM via the smart router (Gemini or OpenRouter, with fallback)
+    const llmStart = Date.now();
+    const response: LLMResponse = await routedChat({
+      model: activeModel,
+      systemInstruction,
+      messages,
+      tools: schemas,
+      temperature: getRuntimeConfig().temperature,
+    });
+    const llmLatencyMs = Date.now() - llmStart;
+
+    // Track token usage (works for both providers)
+    if (response.usage) {
+      recordTokenUsage(
+        chatId,
+        activeModel,
+        response.usage.promptTokens,
+        response.usage.completionTokens,
+        response.usage.totalTokens,
+        llmLatencyMs,
+      );
+    }
+
+    if (response.toolCalls && response.toolCalls.length > 0) {
+      // Append the model's response (with tool calls) to history
+      messages.push({
+        role: "assistant",
+        content: response.text,
+        toolCalls: response.toolCalls,
+      });
+
+      const toolResults: LLMToolResult[] = await Promise.all(
+        response.toolCalls.map(async (call) => {
+          console.log(`${logPrefix} Tool requested: ${call.name}`);
+
+          let toolOutputText = "";
+          try {
+            toolOutputText = await executeTool(
+              call.name,
+              call.args,
+              chatId,
+              permittedNames,
+            );
+          } catch (error) {
+            toolOutputText = `Error calling tool: ${String(error)}`;
+          }
+
+          const preview = toolOutputText.length > 200
+            ? toolOutputText.substring(0, 200) + "..."
+            : toolOutputText;
+          console.log(`${logPrefix} Tool result (${toolOutputText.length} chars): ${preview}`);
+
+          return {
+            callId: call.id,
+            name: call.name,
+            content: toolOutputText,
+          };
+        }),
+      );
+
+      // Append tool results to history
+      messages.push({ role: "user", toolResults });
+    } else {
+      // Final text response — no tool calls
+      const finalResponse = response.text?.trim() || "";
+
+      // Save assistant response to buffer (Tier 2)
+      if (finalResponse) {
+        await saveMessage(chatId, "model", finalResponse);
+      }
+
+      // Trigger background fact extraction (Tier 3 — async, never blocks)
+      triggerFactExtraction(userMessage, finalResponse || "", chatId);
+
+      // Trigger background user profile update (async, never blocks)
+      triggerUserProfileUpdate(chatId, userMessage, finalResponse || "");
+
+      return finalResponse || "No text response generated.";
+    }
+  }
+
+  return (
+    "Error: Agent reached maximum iterations (" +
+    iterLimit +
+    ") without answering."
+  );
+}
+
+// ─── Public Entry Points ─────────────────────────────────────────
 
 /**
  * The core agentic loop with memory integration.
@@ -401,142 +477,36 @@ export async function runAgentLoop(
   deniedToolNames?: string[],
   maxIterations?: number,
 ): Promise<string> {
-  // Hard wall-clock timeout to prevent runaway tool chains
+  const run = async (): Promise<string> => {
+    const iterLimit = maxIterations ?? MAX_ITERATIONS;
+
+    // Load Tier 2 recent messages as conversation history (before saving current)
+    const recentMessages = await getRecentMessages(chatId);
+
+    // Save user message to buffer (Tier 2) — after loading to avoid duplication
+    await saveMessage(chatId, "user", userMessage);
+
+    // Build system instruction with all memory tiers
+    const systemInstruction = await buildSystemInstruction(chatId, userMessage);
+
+    // Build conversation as provider-agnostic LLMMessage[]
+    const messages: LLMMessage[] = recentMessages.map((msg) => ({
+      role: msg.role as "user" | "assistant",
+      content: msg.content,
+    }));
+
+    // Append current user message (it wasn't in DB when we loaded)
+    messages.push({ role: "user", content: userMessage });
+
+    const availableTools = getAvailableTools(allowedToolNames, deniedToolNames);
+
+    return runLoop(chatId, userMessage, systemInstruction, messages, availableTools, iterLimit, "[Agent]");
+  };
+
   const timeoutPromise = new Promise<string>((_, reject) =>
-    setTimeout(() => reject(new Error("Agent loop timed out (120s limit)")), MAX_LOOP_TIMEOUT_MS),
+    setTimeout(() => reject(new Error("Agent loop timed out (300s limit)")), MAX_LOOP_TIMEOUT_MS),
   );
-  return Promise.race([runAgentLoopInner(userMessage, chatId, allowedToolNames, deniedToolNames, maxIterations), timeoutPromise]);
-}
-
-async function runAgentLoopInner(
-  userMessage: string,
-  chatId: string,
-  allowedToolNames?: string[],
-  deniedToolNames?: string[],
-  maxIterations?: number,
-): Promise<string> {
-  const iterLimit = maxIterations ?? MAX_ITERATIONS;
-
-  // Load Tier 2 recent messages as conversation history (before saving current)
-  const recentMessages = await getRecentMessages(chatId);
-
-  // Save user message to buffer (Tier 2) — after loading to avoid duplication
-  await saveMessage(chatId, "user", userMessage);
-
-  // Build system instruction with all memory tiers
-  const systemInstruction = await buildSystemInstruction(chatId, userMessage);
-
-  // Build conversation as provider-agnostic LLMMessage[]
-  const messages: LLMMessage[] = recentMessages.map((msg) => ({
-    role: msg.role as "user" | "assistant",
-    content: msg.content,
-  }));
-
-  // Append current user message (it wasn't in DB when we loaded)
-  messages.push({ role: "user", content: userMessage });
-
-  const { schemas: availableTools, permittedNames } = getAvailableTools(
-    allowedToolNames,
-    deniedToolNames,
-  );
-  let iterationCount = 0;
-
-  while (iterationCount < iterLimit) {
-    iterationCount++;
-
-    const activeModel = getEffectiveModel(chatId);
-    const provider = getProviderName(activeModel);
-    console.log(
-      `[Agent] Iteration ${iterationCount}/${iterLimit} — ${activeModel} (${provider})`,
-    );
-
-    // Ask LLM via the smart router (Gemini or OpenRouter, with fallback)
-    const llmStart = Date.now();
-    const response: LLMResponse = await routedChat({
-      model: activeModel,
-      systemInstruction,
-      messages,
-      tools: availableTools,
-      temperature: getRuntimeConfig().temperature,
-    });
-    const llmLatencyMs = Date.now() - llmStart;
-
-    // Track token usage (works for both providers now)
-    if (response.usage) {
-      recordTokenUsage(
-        chatId,
-        activeModel,
-        response.usage.promptTokens,
-        response.usage.completionTokens,
-        response.usage.totalTokens,
-        llmLatencyMs,
-      );
-    }
-
-    // Handle tool calls
-    if (response.toolCalls && response.toolCalls.length > 0) {
-      // Append the model's response (with tool calls) to history
-      messages.push({
-        role: "assistant",
-        content: response.text,
-        toolCalls: response.toolCalls,
-      });
-
-      const toolResults: LLMToolResult[] = await Promise.all(
-        response.toolCalls.map(async (call) => {
-          console.log(`[Agent] Tool requested: ${call.name}`);
-
-          let toolOutputText = "";
-          try {
-            toolOutputText = await executeTool(
-              call.name,
-              call.args,
-              chatId,
-              permittedNames,
-            );
-          } catch (error) {
-            toolOutputText = `Error calling tool: ${String(error)}`;
-          }
-
-          const preview = toolOutputText.length > 200
-            ? toolOutputText.substring(0, 200) + "..."
-            : toolOutputText;
-          console.log(`[Agent] Tool result (${toolOutputText.length} chars): ${preview}`);
-
-          return {
-            callId: call.id,
-            name: call.name,
-            content: toolOutputText,
-          };
-        }),
-      );
-
-      // Append tool results to history
-      messages.push({
-        role: "user",
-        toolResults,
-      });
-    } else {
-      // Final text response — no tool calls
-      const finalResponse = response.text?.trim() || "";
-
-      // Save assistant response to buffer (Tier 2)
-      if (finalResponse) {
-        await saveMessage(chatId, "model", finalResponse);
-      }
-
-      // Trigger background fact extraction (Tier 3 — async, never blocks)
-      triggerFactExtraction(userMessage, finalResponse || "", chatId);
-
-      return finalResponse || "No text response generated.";
-    }
-  }
-
-  return (
-    "Error: Agent reached maximum iterations (" +
-    iterLimit +
-    ") without answering."
-  );
+  return Promise.race([run(), timeoutPromise]);
 }
 
 /**
@@ -557,133 +527,34 @@ export async function runAgentLoopWithImage(
   imageBase64: string,
   mimeType: string,
 ): Promise<string> {
-  // Hard wall-clock timeout to prevent runaway tool chains
-  const timeoutPromise = new Promise<string>((_, reject) =>
-    setTimeout(() => reject(new Error("Agent loop timed out (120s limit)")), MAX_LOOP_TIMEOUT_MS),
-  );
-  return Promise.race([runAgentLoopWithImageInner(userMessage, chatId, imageBase64, mimeType), timeoutPromise]);
-}
+  const run = async (): Promise<string> => {
+    // Load Tier 2 recent messages for conversation context (before saving current)
+    const recentMessages = await getRecentMessages(chatId);
 
-async function runAgentLoopWithImageInner(
-  userMessage: string,
-  chatId: string,
-  imageBase64: string,
-  mimeType: string,
-): Promise<string> {
-  const iterLimit = MAX_ITERATIONS;
+    // Save a text note to buffer (we can't store binary images)
+    await saveMessage(chatId, "user", `[Sent an image] ${userMessage}`);
 
-  // Load Tier 2 recent messages for conversation context (before saving current)
-  const recentMessages = await getRecentMessages(chatId);
+    const systemInstruction = await buildSystemInstruction(chatId, userMessage);
+    const availableTools = getAvailableTools();
 
-  // Save a text note to buffer (we can't store binary images)
-  await saveMessage(chatId, "user", `[Sent an image] ${userMessage}`);
+    // Build conversation — prepend history, then append image message
+    const messages: LLMMessage[] = recentMessages.map((msg) => ({
+      role: msg.role as "user" | "assistant",
+      content: msg.content,
+    }));
 
-  const systemInstruction = await buildSystemInstruction(chatId, userMessage);
-
-  const { schemas: availableTools, permittedNames } = getAvailableTools();
-
-  // Build conversation — prepend history, then append image message
-  const messages: LLMMessage[] = recentMessages.map((msg) => ({
-    role: msg.role as "user" | "assistant",
-    content: msg.content,
-  }));
-
-  // Append current user message with inline image (it wasn't in DB when we loaded)
-  messages.push({
-    role: "user",
-    content: userMessage,
-    inlineImages: [{ data: imageBase64, mimeType }],
-  });
-
-  let iterationCount = 0;
-
-  while (iterationCount < iterLimit) {
-    iterationCount++;
-
-    const activeModel = getEffectiveModel(chatId);
-    const provider = getProviderName(activeModel);
-    console.log(
-      `[Agent/Vision] Iteration ${iterationCount}/${iterLimit} — ${activeModel} (${provider})`,
-    );
-
-    // Route through the smart router (Gemini or OpenRouter, with fallback)
-    const llmStart = Date.now();
-    const response: LLMResponse = await routedChat({
-      model: activeModel,
-      systemInstruction,
-      messages,
-      tools: availableTools,
-      temperature: getRuntimeConfig().temperature,
+    // Append current user message with inline image (it wasn't in DB when we loaded)
+    messages.push({
+      role: "user",
+      content: userMessage,
+      inlineImages: [{ data: imageBase64, mimeType }],
     });
-    const llmLatencyMs = Date.now() - llmStart;
 
-    // Track token usage
-    if (response.usage) {
-      recordTokenUsage(
-        chatId,
-        activeModel,
-        response.usage.promptTokens,
-        response.usage.completionTokens,
-        response.usage.totalTokens,
-        llmLatencyMs,
-      );
-    }
+    return runLoop(chatId, userMessage, systemInstruction, messages, availableTools, MAX_ITERATIONS, "[Agent/Vision]");
+  };
 
-    // Handle tool calls
-    if (response.toolCalls && response.toolCalls.length > 0) {
-      messages.push({
-        role: "assistant",
-        content: response.text,
-        toolCalls: response.toolCalls,
-      });
-
-      const toolResults: LLMToolResult[] = await Promise.all(
-        response.toolCalls.map(async (call) => {
-          console.log(`[Agent/Vision] Tool requested: ${call.name}`);
-
-          let toolOutputText = "";
-          try {
-            toolOutputText = await executeTool(
-              call.name,
-              call.args,
-              chatId,
-              permittedNames,
-            );
-          } catch (error) {
-            toolOutputText = `Error calling tool: ${String(error)}`;
-          }
-
-          const preview = toolOutputText.length > 200
-            ? toolOutputText.substring(0, 200) + "..."
-            : toolOutputText;
-          console.log(`[Agent/Vision] Tool result (${toolOutputText.length} chars): ${preview}`);
-
-          return {
-            callId: call.id,
-            name: call.name,
-            content: toolOutputText,
-          };
-        }),
-      );
-
-      messages.push({ role: "user", toolResults });
-    } else {
-      // Final text response — no tool calls
-      const finalResponse = response.text?.trim() || "";
-
-      if (finalResponse) {
-        await saveMessage(chatId, "model", finalResponse);
-      }
-
-      triggerFactExtraction(userMessage, finalResponse || "", chatId);
-      return finalResponse || "No text response generated.";
-    }
-  }
-
-  return (
-    "Error: Agent reached maximum iterations (" +
-    iterLimit +
-    ") without answering."
+  const timeoutPromise = new Promise<string>((_, reject) =>
+    setTimeout(() => reject(new Error("Agent loop timed out (300s limit)")), MAX_LOOP_TIMEOUT_MS),
   );
+  return Promise.race([run(), timeoutPromise]);
 }
-

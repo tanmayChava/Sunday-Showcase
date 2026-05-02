@@ -21,6 +21,21 @@
  *   - Body size capped at 64 KB to prevent DoS
  *   - Per-IP rate limiting (30 requests/minute) to prevent abuse
  *   - No external dependencies — uses Node's built-in http module
+ *
+ * IMP-01 — HTTPS requirement:
+ *   This server itself speaks plain HTTP. It MUST be placed behind a
+ *   TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel, Railway,
+ *   etc.) before being exposed to the internet. The bearer token travels in an
+ *   HTTP header and will be readable in plaintext if TLS is not enforced.
+ *   Set WEBHOOK_BEHIND_PROXY=true in .env to silence this warning once you
+ *   have confirmed TLS termination is in place.
+ *
+ * IMP-02 — X-Forwarded-For trust:
+ *   X-Forwarded-For can be forged by any client unless it is stripped and
+ *   re-written by a trusted upstream proxy. SUNDAY only reads XFF for
+ *   rate-limiting when WEBHOOK_TRUSTED_PROXY=true is explicitly set, signalling
+ *   that a trusted proxy is rewriting the header. Without it, the raw TCP
+ *   socket address is used exclusively.
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "http";
@@ -117,6 +132,33 @@ let server: ReturnType<typeof createServer> | null = null;
 export function startWebhookServer(config: WebhookConfig): void {
     const { port, token, chatId, bot } = config;
 
+    // ── IMP-01: HTTPS enforcement warning ─────────────────────────────────
+    // This server speaks plain HTTP. If it is reachable from the internet
+    // without a TLS-terminating proxy in front of it, the bearer token and
+    // all payloads travel in cleartext. Emit a loud warning unless the
+    // operator has explicitly acknowledged proxy-based TLS termination.
+    const behindProxy = process.env.WEBHOOK_BEHIND_PROXY === "true";
+    if (!behindProxy) {
+        console.warn(
+            "[Webhook] ⚠️  SECURITY WARNING (IMP-01): The webhook server is running on",
+            `plain HTTP (port ${port}). This is only safe if a TLS-terminating`,
+            "reverse proxy (nginx, Caddy, Cloudflare Tunnel, Railway HTTPS) sits",
+            "in front of it. Set WEBHOOK_BEHIND_PROXY=true in .env once TLS is",
+            "confirmed to silence this warning.",
+        );
+    }
+
+    // ── IMP-02: Trusted-proxy guard for X-Forwarded-For ──────────────────
+    // Only trust XFF when an explicit env var confirms a controlled proxy
+    // is sanitising the header. Without this, any client can spoof the
+    // header to bypass per-IP rate limits.
+    const trustProxy = process.env.WEBHOOK_TRUSTED_PROXY === "true";
+    if (!trustProxy) {
+        console.log(
+            "[Webhook] Rate limiter using raw socket IP (WEBHOOK_TRUSTED_PROXY not set).",
+        );
+    }
+
     // Start background cleanup of expired rate limit entries
     startRateLimitCleanup();
 
@@ -131,9 +173,14 @@ export function startWebhookServer(config: WebhookConfig): void {
         }
 
         // ── Rate limiting (before auth to throttle brute-force guessing) ──
-        const clientIp = req.headers["x-forwarded-for"]
+        // IMP-02: Only read X-Forwarded-For when WEBHOOK_TRUSTED_PROXY=true.
+        // Blindly trusting XFF lets any attacker forge the header and evade
+        // per-IP rate limits entirely. A controlled upstream proxy must strip
+        // and re-inject the header before it can be trusted.
+        const rawSocketIp = req.socket.remoteAddress || "unknown";
+        const clientIp = trustProxy && req.headers["x-forwarded-for"]
             ? String(req.headers["x-forwarded-for"]).split(",")[0].trim()
-            : req.socket.remoteAddress || "unknown";
+            : rawSocketIp;
 
         if (!checkRateLimit(clientIp)) {
             console.warn(`[Webhook] Rate limited IP: ${clientIp}`);
@@ -189,9 +236,40 @@ export function startWebhookServer(config: WebhookConfig): void {
             return;
         }
 
-        // Build notification
-        const source = payload.source ? `<b>${payload.source}</b>` : "<b>Webhook</b>";
-        const notification = `🔔 ${source}\n\n${payload.message}`;
+        // IMP-04: Prompt Injection via payload.message
+        // payload.message is delivered to Telegram with parse_mode:"HTML".
+        // A malicious caller (or compromised CI system) could embed HTML tags
+        // that Telegram renders — e.g. <a href="...">, <b>, hidden characters,
+        // or ANSI escape sequences that might affect log parsing.
+        // Strip all HTML tags and control chars before building the notification.
+        const MAX_MESSAGE_LENGTH = 2000;
+        const MAX_SOURCE_LENGTH = 100;
+
+        const sanitizeText = (raw: string): string =>
+            raw
+                .replace(/<[^>]*>/g, "")           // strip all HTML tags
+                .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // strip control chars
+                .trim();
+
+        const safeMessage = sanitizeText(payload.message).substring(0, MAX_MESSAGE_LENGTH);
+        const safeSource  = payload.source
+            ? sanitizeText(payload.source).substring(0, MAX_SOURCE_LENGTH)
+            : null;
+
+        if (!safeMessage) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "'message' is empty after sanitisation" }));
+            return;
+        }
+
+        // Build notification — use sanitised values only, escape for HTML
+        const escapeHtml = (s: string) =>
+            s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+        const source = safeSource
+            ? `<b>${escapeHtml(safeSource)}</b>`
+            : "<b>Webhook</b>";
+        const notification = `🔔 ${source}\n\n${escapeHtml(safeMessage)}`;
 
         // Send to Telegram with HTML parsing
         try {
@@ -204,7 +282,7 @@ export function startWebhookServer(config: WebhookConfig): void {
             }
 
             console.log(
-                `[Webhook] Received from ${payload.source || "unknown"}: ${payload.message.substring(0, 80)}`,
+                `[Webhook] Received from ${safeSource || "unknown"}: ${safeMessage.substring(0, 80)}`,
             );
 
             res.writeHead(200, { "Content-Type": "application/json" });

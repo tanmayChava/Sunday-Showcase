@@ -26,8 +26,22 @@ import type {
 
 // ─── Key Rotation ─────────────────────────────────────────────────
 
+// HIGH-01 Fix: Concurrency-safe key rotation.
+//
+// The old design used a shared `lastUsedKeyIndex` variable that was read by
+// rotateKey() after an async gap (the await inside chat()). Under concurrent
+// calls, two coroutines could race:
+//   - Call A reads lastUsedKeyIndex=0, starts request
+//   - Call B reads lastUsedKeyIndex=0, starts request (same key)
+//   - Call A gets 429, rotateKey() reads lastUsedKeyIndex=0 → exhausts key 0
+//   - Call B gets 429, rotateKey() reads lastUsedKeyIndex=1 (already advanced)
+//     → exhausts key 1 by mistake
+//
+// Fix: getAI() returns { client, keyIndex } so each chat() call owns its key
+// index snapshot. rotateKey() takes an explicit ownedKeyIndex instead of
+// reading shared mutable state. No global lastUsedKeyIndex needed.
+
 let currentKeyIndex = 0;
-let lastUsedKeyIndex = 0;
 const exhaustedKeys = new Set<number>();
 let lastResetTime = Date.now();
 const RESET_INTERVAL_MS = 60 * 1000;
@@ -35,12 +49,22 @@ const RESET_INTERVAL_MS = 60 * 1000;
 /** Cached GoogleGenAI clients — one per API key index. */
 const clientCache = new Map<number, GoogleGenAI>();
 
+interface AIHandle {
+  /** The GoogleGenAI client to use for this call. */
+  client: GoogleGenAI;
+  /** The key index this handle was allocated for — pass to rotateKey(). */
+  keyIndex: number;
+}
+
 /**
- * Get a GoogleGenAI instance using the next available (non-exhausted) key.
- * Clients are cached per key to avoid re-creating objects on every call.
+ * Allocate a GoogleGenAI client for one call.
+ * Returns both the client AND the key index it selected, so the caller
+ * can pass the exact index to rotateKey() after an async gap without
+ * racing against other concurrent callers.
+ *
  * Exported so vision path and semantic embeddings can share rotation.
  */
-export function getAI(): GoogleGenAI {
+export function getAI(): AIHandle {
   if (Date.now() - lastResetTime > RESET_INTERVAL_MS) {
     if (exhaustedKeys.size > 0) {
       console.log(
@@ -53,20 +77,19 @@ export function getAI(): GoogleGenAI {
 
   const keys = ENV.GEMINI_API_KEYS;
 
-  // Skip exhausted keys proactively
+  // Skip exhausted keys proactively — find the next available one
   for (let i = 0; i < keys.length; i++) {
     const idx = (currentKeyIndex + i) % keys.length;
     if (!exhaustedKeys.has(idx)) {
-      lastUsedKeyIndex = idx;
       currentKeyIndex = (idx + 1) % keys.length;
-      return getOrCreateClient(idx, keys[idx]);
+      return { client: getOrCreateClient(idx, keys[idx]), keyIndex: idx };
     }
   }
 
-  // All exhausted — use current anyway (retry logic will handle it)
-  lastUsedKeyIndex = currentKeyIndex;
+  // All exhausted — allocate current anyway (retry / router fallback handles it)
+  const idx = currentKeyIndex;
   currentKeyIndex = (currentKeyIndex + 1) % keys.length;
-  return getOrCreateClient(lastUsedKeyIndex, keys[lastUsedKeyIndex]);
+  return { client: getOrCreateClient(idx, keys[idx]), keyIndex: idx };
 }
 
 function getOrCreateClient(index: number, apiKey: string): GoogleGenAI {
@@ -78,21 +101,24 @@ function getOrCreateClient(index: number, apiKey: string): GoogleGenAI {
   return client;
 }
 
-function rotateKey(): boolean {
+/**
+ * Mark ownedKeyIndex as exhausted (429) and select the next available key.
+ * Takes the caller's owned index to avoid race conditions with shared state.
+ * @returns true if a new key was found, false if all keys are exhausted.
+ */
+function rotateKey(ownedKeyIndex: number): boolean {
   const keys = ENV.GEMINI_API_KEYS;
-  exhaustedKeys.add(lastUsedKeyIndex);
+  exhaustedKeys.add(ownedKeyIndex);
 
   console.log(
-    `[Gemini] Key ${lastUsedKeyIndex + 1}/${keys.length} hit rate limit. Rotating...`,
+    `[Gemini] Key ${ownedKeyIndex + 1}/${keys.length} hit rate limit. Rotating...`,
   );
 
   for (let i = 0; i < keys.length; i++) {
-    const nextIndex = (lastUsedKeyIndex + 1 + i) % keys.length;
+    const nextIndex = (ownedKeyIndex + 1 + i) % keys.length;
     if (!exhaustedKeys.has(nextIndex)) {
       currentKeyIndex = nextIndex;
-      console.log(
-        `[Gemini] Switched to key ${currentKeyIndex + 1}/${keys.length}.`,
-      );
+      console.log(`[Gemini] Switched to key ${nextIndex + 1}/${keys.length}.`);
       return true;
     }
   }
@@ -268,8 +294,11 @@ class GeminiProvider implements LLMProvider {
     let lastError: unknown;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // HIGH-01: capture our own key snapshot — concurrent calls each get
+      // their own {client, keyIndex} and never share lastUsedKeyIndex.
+      const { client, keyIndex: ownedIndex } = getAI();
       try {
-        const response = await getAI().models.generateContent({
+        const response = await client.models.generateContent({
           model: params.model,
           contents,
           config: {
@@ -304,7 +333,7 @@ class GeminiProvider implements LLMProvider {
         const status = (error as { status?: number }).status;
 
         if (status === 429) {
-          const rotated = rotateKey();
+          const rotated = rotateKey(ownedIndex);
           if (!rotated) {
             // All keys exhausted — do NOT block the event loop for 30-60s.
             // Wait a short fixed delay (5s) to avoid hammering the API, then

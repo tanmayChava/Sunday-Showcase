@@ -11,40 +11,16 @@
  *   Categories: 'personal' | 'project' | 'preference' | 'goal' | 'event' | 'general'
  *   Do NOT store: casual chat, jokes, small talk, temporary emotions
  *
- * Note: Embeddings always use the Gemini SDK directly (embedContent API).
+ * Note: Embeddings are model-agnostic via src/lib/embeddings.ts.
+ *       Provider is selected by EMBEDDING_PROVIDER env var (default: gemini).
  *       Fact extraction uses the provider-agnostic router.
  */
 
 import { getSupabase } from "../lib/supabase.js";
-import { getAI } from "../lib/gemini.js";
+import { embed } from "../lib/embeddings.js";
 import { routedChat } from "../lib/router.js";
 import { ENV } from "../config.js";
 import { getRuntimeConfig } from "../lib/config-sync.js";
-
-/**
- * Generate an embedding for a given text using Gemini.
- * Uses gemini-embedding-001 with 768 dimensions for pgvector compatibility.
- *
- * Note: Embeddings are Gemini-specific — OpenRouter doesn't support them.
- * We use the Gemini SDK directly here, not the provider-agnostic router.
- */
-async function embed(text: string): Promise<number[] | null> {
-  try {
-    const ai = getAI();
-
-    const result = await ai.models.embedContent({
-      model: "gemini-embedding-001",
-      contents: text,
-      config: {
-        outputDimensionality: 768,
-      },
-    });
-    return result.embeddings?.[0]?.values || null;
-  } catch (err) {
-    console.error("[Semantic] Embedding error:", err);
-    return null;
-  }
-}
 
 /**
  * Store a fact or event into semantic memory.

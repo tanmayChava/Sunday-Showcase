@@ -24,7 +24,7 @@ describe("handleSlashCommand", () => {
     it("handles /help command", async () => {
         const result = await handleSlashCommand("/help", CHAT_ID);
         expect(result.handled).toBe(true);
-        expect(result.response).toContain("Slash Commands");
+        expect(result.response).toContain("SUNDAY Commands");
         expect(result.response).toContain("/status");
         expect(result.response).toContain("/model");
         expect(result.response).toContain("/heartbeat");

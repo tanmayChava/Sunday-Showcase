@@ -60,7 +60,7 @@ function makeSupabase(overrides: {
     const makeDataChain = (): any => new Proxy({}, {
         get(_target, prop) {
             if (prop === "then") {
-                return (resolve: Function) =>
+                return (resolve: (v: { data: any[]; error: { message: string } | null }) => unknown) =>
                     Promise.resolve({ data: selectData, error: selectError }).then(resolve);
             }
             // Any chainable method returns a fresh thenable chain
@@ -72,7 +72,7 @@ function makeSupabase(overrides: {
     const makeCountChain = (): any => new Proxy({}, {
         get(_target, prop) {
             if (prop === "then") {
-                return (resolve: Function) =>
+                return (resolve: (v: { count: number | null; error: { message: string } | null }) => unknown) =>
                     Promise.resolve({ count: selectCount, error: selectError }).then(resolve);
             }
             return vi.fn(() => makeCountChain());
@@ -83,7 +83,7 @@ function makeSupabase(overrides: {
     const makeDeleteChain = (): any => new Proxy({}, {
         get(_target, prop) {
             if (prop === "then") {
-                return (resolve: Function) =>
+                return (resolve: (v: { error: { message: string } | null }) => unknown) =>
                     Promise.resolve({ error: deleteError }).then(resolve);
             }
             return vi.fn(() => makeDeleteChain());
@@ -92,7 +92,7 @@ function makeSupabase(overrides: {
 
     // Insert - resolves to insertResult
     const insertFn = vi.fn(() => ({
-        then: (resolve: Function) => Promise.resolve(insertResult).then(resolve),
+        then: (resolve: (v: typeof insertResult) => unknown) => Promise.resolve(insertResult).then(resolve),
     }));
 
     const fromFn = vi.fn(() => ({

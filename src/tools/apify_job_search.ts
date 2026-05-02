@@ -77,10 +77,20 @@ export const apifyJobSearchDefinition: Tool = {
                         description:
                             "Optional experience filter (LinkedIn): 'internship', 'entry_level', 'associate', 'mid_senior_level', 'director'",
                     },
+                    experience_min: {
+                        type: Type.NUMBER,
+                        description:
+                            "Minimum years of experience required. E.g. 0 for freshers. Used for Naukri and keyword-based filtering on other platforms.",
+                    },
+                    experience_max: {
+                        type: Type.NUMBER,
+                        description:
+                            "Maximum years of experience required. E.g. 1 for entry-level (0-1 yrs). Used for Naukri and keyword-based filtering.",
+                    },
                     keywords: {
                         type: Type.STRING,
                         description:
-                            "Optional extra keywords to refine the search, e.g. 'non-technical', 'fresher', 'remote'",
+                            "Optional extra keywords to refine the search, e.g. 'non-technical', 'fresher', 'remote', '0-1 years experience'",
                     },
                 },
                 required: ["role"],
@@ -136,8 +146,20 @@ function buildActorInput(
     maxResults: number,
     experienceLevel?: string,
     keywords?: string,
+    experienceMin?: number,
+    experienceMax?: number,
 ): Record<string, unknown> {
-    const query = keywords ? `${role} ${keywords}` : role;
+    // Embed experience range into keywords for platforms that don't support it natively
+    let expKeyword = "";
+    if (experienceMin !== undefined && experienceMax !== undefined) {
+        expKeyword = experienceMin === 0 ? `fresher ${experienceMax} years experience` : `${experienceMin}-${experienceMax} years experience`;
+    } else if (experienceMin !== undefined) {
+        expKeyword = `${experienceMin}+ years experience`;
+    } else if (experienceMax !== undefined) {
+        expKeyword = `0-${experienceMax} years experience`;
+    }
+    const allKeywords = [keywords, expKeyword].filter(Boolean).join(" ").trim();
+    const query = allKeywords ? `${role} ${allKeywords}` : role;
 
     switch (platform) {
         case "linkedin": {
@@ -163,13 +185,17 @@ function buildActorInput(
         }
 
         case "naukri": {
-            return {
+            const naukriInput: Record<string, unknown> = {
                 keyword: query,
                 location,
                 maxItems: maxResults,
                 // Naukri actor accepts jobAge in days
                 jobAge: dateKey === "past24hours" ? 1 : dateKey === "pastweek" ? 7 : 30,
             };
+            // Naukri supports experience range natively
+            if (experienceMin !== undefined) naukriInput.experienceMin = experienceMin;
+            if (experienceMax !== undefined) naukriInput.experienceMax = experienceMax;
+            return naukriInput;
         }
 
         case "glassdoor": {
@@ -268,6 +294,8 @@ export async function executeApifyJobSearch(args: {
     date_posted?: string;
     max_results?: number;
     experience_level?: string;
+    experience_min?: number;
+    experience_max?: number;
     keywords?: string;
 }): Promise<string> {
     if (!ENV.APIFY_API_TOKEN) {
@@ -293,21 +321,30 @@ export async function executeApifyJobSearch(args: {
         maxResults,
         args.experience_level,
         args.keywords,
+        args.experience_min,
+        args.experience_max,
     );
 
     try {
         console.log(`[ApifyJobSearch] Actor: ${actorId} | Role: "${args.role}" | Location: ${location} | Date: ${dateRaw}`);
 
         const encodedActor = encodeURIComponent(actorId);
+        // timeout=30: Apify waits up to 30s for the actor to finish before returning;
+        // AbortController gives us a hard 35s fetch deadline so we never hang longer.
         const runUrl =
             `https://api.apify.com/v2/acts/${encodedActor}/run-sync-get-dataset-items` +
-            `?token=${ENV.APIFY_API_TOKEN}&timeout=60&memory=256`;
+            `?token=${ENV.APIFY_API_TOKEN}&timeout=30&memory=256`;
+
+        const abortCtrl = new AbortController();
+        const abortTimer = setTimeout(() => abortCtrl.abort(), 35_000);
 
         const response = await fetch(runUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(actorInput),
+            signal: abortCtrl.signal,
         });
+        clearTimeout(abortTimer);
 
         if (!response.ok) {
             const errText = await response.text();
@@ -362,6 +399,15 @@ export async function executeApifyJobSearch(args: {
         return [...header, ...body, ...footer].join("\n");
 
     } catch (error) {
+        // AbortError = our 35s fetch deadline fired (Apify was too slow)
+        const isAbort = error instanceof Error && (error.name === "AbortError" || error.message.includes("abort"));
+        if (isAbort) {
+            console.warn(`[ApifyJobSearch] ${platform} timed out (>35s) — try a different platform.`);
+            return (
+                `Job search on ${platform} timed out (>35 seconds).\n` +
+                `Try a different platform: ${Object.keys(ACTORS).filter((p) => p !== platform).join(", ")}`
+            );
+        }
         console.error("[ApifyJobSearch] Error:", error);
         return `Job search failed: ${String(error)}`;
     }

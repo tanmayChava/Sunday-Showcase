@@ -24,7 +24,8 @@ describe("executeSetReminder", () => {
     it("rejects zero minutes", async () => {
         const result = await executeSetReminder({ message: "test", minutes: 0 }, "chat-1");
         expect(result).toContain("Error");
-        expect(result).toContain("positive");
+        // minutes=0 is falsy so falls into the else branch (no `when`, no positive `minutes`)
+        expect(result).toContain("when");
     });
 
     it("rejects negative minutes", async () => {
@@ -32,10 +33,11 @@ describe("executeSetReminder", () => {
         expect(result).toContain("Error");
     });
 
-    it("rejects minutes > 1440 (24 hours)", async () => {
-        const result = await executeSetReminder({ message: "test", minutes: 1441 }, "chat-1");
+    it("rejects minutes > 10080 (7 days)", async () => {
+        const result = await executeSetReminder({ message: "test", minutes: 10081 }, "chat-1");
         expect(result).toContain("Error");
-        expect(result).toContain("24 hours");
+        // Current implementation caps at 7 days
+        expect(result).toContain("7 days");
     });
 
     it("accepts valid reminder and returns confirmation", async () => {

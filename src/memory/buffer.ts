@@ -13,6 +13,39 @@ import { ENV } from "../config.js";
 
 const MAX_BUFFER_SIZE = 20;
 
+// ─── Compaction Prompt Template ──────────────────────────────────
+
+/**
+ * Shared prompt used by both auto-compaction (maybeCompact) and manual
+ * compaction (compactChatHistory). Single source of truth for the
+ * structure of rolling summaries.
+ */
+const COMPACTION_PROMPT_TEMPLATE =
+  `Summarize this conversation into a structured memory block. Use these sections (skip empty ones):
+
+## Decisions Made
+- ...
+
+## Active Projects / Tasks
+- ...
+
+## Action Items & Commitments
+- ...
+
+## Key Context
+- ...
+
+Do NOT include greetings, small talk, or irrelevant chatter. Be concise but preserve all important details.
+
+`;
+
+/**
+ * Per-chat compaction lock — prevents two concurrent saveMessage calls
+ * from both triggering maybeCompact and double-deleting the same messages.
+ * CRIT-01 fix: simple in-process mutex using a Set of chatIds.
+ */
+const compactingChats = new Set<string>();
+
 interface BufferMessage {
   role: string;
   content: string;
@@ -85,9 +118,20 @@ export async function getRecentMessages(
  * Preserves decisions, commitments, and unresolved items.
  */
 async function maybeCompact(chatId: string): Promise<void> {
+  // CRIT-01: Per-chat lock — bail out immediately if compaction is already
+  // in progress for this chat. Without this guard, two concurrent saveMessage
+  // calls (user message + assistant response in the same turn) both see count
+  // > MAX_BUFFER_SIZE and race to delete the same overflow rows, causing
+  // double deletion and potential summary loss.
+  if (compactingChats.has(chatId)) {
+    console.log(`[Buffer] Compaction already in progress for chat ${chatId} — skipping.`);
+    return;
+  }
+
   const sb = getSupabase();
   if (!sb) return;
 
+  compactingChats.add(chatId);
   try {
     // Count total messages for this chat
     const { count, error: countError } = await sb
@@ -119,28 +163,7 @@ async function maybeCompact(chatId: string): Promise<void> {
     // Use LLM to create a structured rolling summary (provider-agnostic)
     const response = await routedChat({
       model: ENV.GEMINI_MODEL,
-      messages: [
-        {
-          role: "user",
-          content: `Summarize this conversation into a structured memory block. Use these sections (skip empty ones):
-
-## Decisions Made
-- ...
-
-## Active Projects / Tasks
-- ...
-
-## Action Items & Commitments
-- ...
-
-## Key Context
-- ...
-
-Do NOT include greetings, small talk, or irrelevant chatter. Be concise but preserve all important details.
-
-${transcript}`,
-        },
-      ],
+      messages: [{ role: "user", content: COMPACTION_PROMPT_TEMPLATE + transcript }],
       temperature: 0.3,
     });
 
@@ -173,6 +196,9 @@ ${transcript}`,
     }
   } catch (err) {
     console.error("[Buffer] Compaction error:", err);
+  } finally {
+    // Always release the lock — even if LLM or DB calls threw
+    compactingChats.delete(chatId);
   }
 }
 
@@ -268,28 +294,7 @@ export async function compactChatHistory(chatId: string): Promise<string> {
 
     const response = await routedChat({
       model: ENV.GEMINI_MODEL,
-      messages: [
-        {
-          role: "user",
-          content: `Summarize this conversation into a structured memory block. Use these sections (skip empty ones):
-
-## Decisions Made
-- ...
-
-## Active Projects / Tasks
-- ...
-
-## Action Items & Commitments
-- ...
-
-## Key Context
-- ...
-
-Do NOT include greetings, small talk, or irrelevant chatter. Be concise but preserve all important details.
-
-${contextPrefix}${transcript}`,
-        },
-      ],
+      messages: [{ role: "user", content: COMPACTION_PROMPT_TEMPLATE + contextPrefix + transcript }],
       temperature: 0.3,
     });
 

@@ -3,6 +3,10 @@
  *
  * Each job runs at a specific IST time and sends a message
  * to the user's Telegram chat.
+ *
+ * Jobs:
+ *   1. Morning Check-in  — news + daily goal prompt (HEARTBEAT_MORNING_TIME, default 08:00 IST)
+ *   2. Evening Briefing  — day summary + tomorrow prep  (HEARTBEAT_EVENING_TIME, default 21:00 IST)
  */
 
 import { Bot } from "grammy";
@@ -115,6 +119,61 @@ function parseMorningTime(): { hour: number; minute: number } {
 
 const morningTime = parseMorningTime();
 
+// ─── Evening Briefing Job ────────────────────────────────────────────────────
+
+/**
+ * Evening Briefing — Sent at HEARTBEAT_EVENING_TIME (default 21:00 IST).
+ *
+ * Sends a short fixed-template wrap-up that pulls the morning goal from
+ * core memory. No LLM call needed — saves tokens and keeps it snappy.
+ */
+async function eveningBriefing(bot: Bot, chatId: string): Promise<void> {
+  console.log("[Heartbeat] Running evening briefing...");
+
+  // Pull this morning's goal (if set) from core memory
+  const morningGoal = getCoreMemory("last_daily_goal");
+
+  // Build the message from a fixed template
+  let message = "🌙 Evening check-in.\n\n";
+
+  if (morningGoal) {
+    message += `This morning you set out to: "${morningGoal}"\n\n`;
+    message += "Did you hit it? What's the one thing you want to tackle first tomorrow?";
+  } else {
+    message += "How did today go? What's the one priority you want to tackle first thing tomorrow?";
+  }
+
+  try {
+    await bot.api.sendMessage(chatId, message);
+    await saveMessage(chatId, "model", message);
+    console.log("[Heartbeat] Evening briefing sent.");
+  } catch (err) {
+    console.error("[Heartbeat] Failed to send evening briefing:", err);
+  }
+}
+
+/**
+ * Parse the HEARTBEAT_EVENING_TIME env var (format: "HH:MM").
+ * Falls back to 21:00 if not set or malformed.
+ */
+function parseEveningTime(): { hour: number; minute: number } {
+  const raw = process.env.HEARTBEAT_EVENING_TIME || "21:00";
+  const match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) {
+    console.warn(`[Heartbeat] Invalid HEARTBEAT_EVENING_TIME="${raw}" — using 21:00`);
+    return { hour: 21, minute: 0 };
+  }
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    console.warn("[Heartbeat] HEARTBEAT_EVENING_TIME out of range — using 21:00");
+    return { hour: 21, minute: 0 };
+  }
+  return { hour, minute };
+}
+
+const eveningTime = parseEveningTime();
+
 /**
  * All heartbeat jobs.
  */
@@ -124,5 +183,11 @@ export const heartbeatJobs: HeartbeatJob[] = [
     hour: morningTime.hour,
     minute: morningTime.minute,
     execute: morningCheckin,
+  },
+  {
+    name: "Evening Briefing",
+    hour: eveningTime.hour,
+    minute: eveningTime.minute,
+    execute: eveningBriefing,
   },
 ];

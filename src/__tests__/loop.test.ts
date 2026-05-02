@@ -85,6 +85,11 @@ vi.mock("../memory/semantic.js", () => ({
     triggerFactExtraction: () => { },
 }));
 
+vi.mock("../memory/user-profile.js", () => ({
+    buildUserProfilePrompt: () => "",
+    triggerUserProfileUpdate: () => { },
+}));
+
 // ─── Import after mocks ───────────────────────────────────────────
 
 import { runAgentLoop } from "../agent/loop.js";
